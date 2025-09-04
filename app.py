@@ -43,7 +43,7 @@ STANDARD_FORMAT = {
 }
 
 def analyze_file_with_ai(df, standard_format):
-    """Use AI to suggest initial mappings and ask clarifying questions"""
+    """Use AI to suggest initial mappings and identify unclear fields"""
     
     # Get sample data for context
     sample_data = df.head(3).to_string()
@@ -56,18 +56,52 @@ def analyze_file_with_ai(df, standard_format):
     {sample_data}
     
     I need to map these columns to this standard format: {list(standard_format.keys())}
+    Standard format descriptions: {standard_format}
     
     Please:
-    1. Suggest the most likely mappings based on column names and sample data
-    2. Identify any ambiguous columns that need clarification
-    3. Ask specific questions about unclear mappings
+    1. Suggest mappings for columns you're confident about
+    2. Identify columns that are unclear or ambiguous
+    3. For unclear columns, DO NOT guess - mark them as needing clarification
     
     Respond in JSON format:
     {{
-        "suggested_mappings": {{"standard_field": "input_column"}},
-        "questions": ["Question 1 about ambiguous field X", "Question 2 about field Y"],
-        "confidence": {{"input_column": 0.9}}
+        "confident_mappings": {{"standard_field": "input_column"}},
+        "unclear_columns": ["column1", "column2"],
+        "confidence_scores": {{"input_column": 0.95}}
     }}
+    
+    Only include mappings you're very confident about (>80% sure).
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        st.error(f"AI analysis failed: {e}")
+        return {"confident_mappings": {}, "unclear_columns": [], "confidence_scores": {}}
+
+def ask_about_unclear_column(column_name, sample_values, standard_format):
+    """Generate a smart question about an unclear column"""
+    
+    # Get a few sample values to provide context
+    sample_text = ", ".join([str(v) for v in sample_values[:3] if str(v).strip()])
+    
+    prompt = f"""
+    I have a column named "{column_name}" with sample values: {sample_text}
+    
+    I need to map it to one of these standard fields: {list(standard_format.keys())}
+    Standard field descriptions: {standard_format}
+    
+    Generate a clear, concise question to ask the user what this column contains.
+    The question should help determine which standard field it maps to.
+    
+    Format: Just return the question text, nothing else.
     """
     
     try:
@@ -77,34 +111,46 @@ def analyze_file_with_ai(df, standard_format):
             temperature=0.3
         )
         
-        result = json.loads(response.choices[0].message.content)
-        return result
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        st.error(f"AI analysis failed: {e}")
-        return {"suggested_mappings": {}, "questions": [], "confidence": {}}
+        return f"What type of data does the column '{column_name}' contain?"
 
-def chat_with_ai(message, context):
-    """Handle conversational questions about mappings"""
+def interpret_user_response(user_response, column_name, standard_format):
+    """Interpret user's response to determine which standard field to map to"""
     
     prompt = f"""
-    Context: {context}
+    The user was asked about column "{column_name}" and responded: "{user_response}"
     
-    User question: {message}
+    Based on their response, which of these standard fields should it map to?
+    Available fields: {list(standard_format.keys())}
+    Field descriptions: {standard_format}
     
-    Please provide a helpful response about the file mapping process. 
-    Be specific and actionable.
+    Respond with ONLY the field name (e.g., "company" or "first_name") or "NONE" if unclear.
     """
     
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
+            temperature=0.1
         )
         
-        return response.choices[0].message.content
+        result = response.choices[0].message.content.strip().lower()
+        
+        # Validate the response
+        if result in standard_format.keys():
+            return result
+        elif result == "none":
+            return None
+        else:
+            # Try to find a partial match
+            for field in standard_format.keys():
+                if field in result or result in field:
+                    return field
+            return None
+            
     except Exception as e:
-        return f"Sorry, I encountered an error: {e}"
+        return None
 
 def apply_mapping(df, mapping):
     """Apply the mapping to create standardized output"""
@@ -131,8 +177,16 @@ def main():
         st.session_state.ai_analysis = None
     if 'mapping' not in st.session_state:
         st.session_state.mapping = {}
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
+    if 'unclear_columns' not in st.session_state:
+        st.session_state.unclear_columns = []
+    if 'current_question_index' not in st.session_state:
+        st.session_state.current_question_index = 0
+    if 'ai_questions_complete' not in st.session_state:
+        st.session_state.ai_questions_complete = False
+    if 'current_question' not in st.session_state:
+        st.session_state.current_question = ""
+    if 'current_column' not in st.session_state:
+        st.session_state.current_column = ""
     
     # Sidebar for standard format reference
     with st.sidebar:
@@ -145,8 +199,8 @@ def main():
         st.markdown("### 🚀 Quick Start")
         st.markdown("1. Upload your CSV file")
         st.markdown("2. Click 'Analyze with AI'")
-        st.markdown("3. Review suggested mappings")
-        st.markdown("4. Chat with AI for help")
+        st.markdown("3. Answer AI questions about unclear fields")
+        st.markdown("4. Review and adjust mappings")
         st.markdown("5. Download mapped file")
     
     # Main content area
@@ -193,9 +247,14 @@ def main():
                     with st.spinner("🧠 AI is analyzing your file..."):
                         st.session_state.ai_analysis = analyze_file_with_ai(df, STANDARD_FORMAT)
                         
-                        # Initialize mapping with AI suggestions
-                        if st.session_state.ai_analysis.get('suggested_mappings'):
-                            st.session_state.mapping = st.session_state.ai_analysis['suggested_mappings']
+                        # Initialize mapping with confident AI suggestions
+                        if st.session_state.ai_analysis.get('confident_mappings'):
+                            st.session_state.mapping = st.session_state.ai_analysis['confident_mappings']
+                        
+                        # Set up unclear columns for questioning
+                        st.session_state.unclear_columns = st.session_state.ai_analysis.get('unclear_columns', [])
+                        st.session_state.current_question_index = 0
+                        st.session_state.ai_questions_complete = len(st.session_state.unclear_columns) == 0
                         
                         st.success("✅ AI analysis complete!")
                         st.rerun()
@@ -205,93 +264,140 @@ def main():
                 st.info("💡 Try selecting a different delimiter or check your file format")
     
     with col2:
-        st.header("🔗 Field Mapping")
+        st.header("🤖 AI Assistant")
         
-        if st.session_state.df is not None:
-            df = st.session_state.df
+        if st.session_state.df is not None and st.session_state.ai_analysis:
             
-            # Show AI questions if available
-            if st.session_state.ai_analysis and st.session_state.ai_analysis.get('questions'):
+            # Show confident mappings first
+            if st.session_state.ai_analysis.get('confident_mappings'):
+                st.subheader("✅ AI Auto-Mapped Fields")
+                for standard_field, input_column in st.session_state.ai_analysis['confident_mappings'].items():
+                    confidence = st.session_state.ai_analysis.get('confidence_scores', {}).get(input_column, 0)
+                    st.success(f"**{standard_field}** ← `{input_column}` ({confidence:.0%} confidence)")
+            
+            # AI Questioning Section
+            if not st.session_state.ai_questions_complete and st.session_state.unclear_columns:
                 st.subheader("❓ AI Questions")
-                for i, question in enumerate(st.session_state.ai_analysis['questions']):
-                    st.warning(f"**Q{i+1}:** {question}")
-            
-            # Manual mapping interface
-            st.subheader("🎯 Configure Mappings")
-            
-            input_columns = [""] + list(df.columns)
-            
-            for standard_field, description in STANDARD_FORMAT.items():
-                col_a, col_b = st.columns([3, 1])
                 
-                with col_a:
-                    # Get current mapping or AI suggestion
-                    current_value = st.session_state.mapping.get(standard_field, "")
-                    if current_value not in input_columns:
-                        current_value = ""
+                current_idx = st.session_state.current_question_index
+                if current_idx < len(st.session_state.unclear_columns):
+                    current_col = st.session_state.unclear_columns[current_idx]
                     
-                    selected = st.selectbox(
-                        f"`{standard_field}` - {description}",
-                        input_columns,
-                        index=input_columns.index(current_value) if current_value in input_columns else 0,
-                        key=f"mapping_{standard_field}"
+                    # Generate question if not already generated
+                    if st.session_state.current_column != current_col:
+                        st.session_state.current_column = current_col
+                        sample_values = st.session_state.df[current_col].dropna().head(3).tolist()
+                        st.session_state.current_question = ask_about_unclear_column(
+                            current_col, sample_values, STANDARD_FORMAT
+                        )
+                    
+                    # Show progress
+                    st.progress((current_idx) / len(st.session_state.unclear_columns))
+                    st.caption(f"Question {current_idx + 1} of {len(st.session_state.unclear_columns)}")
+                    
+                    # Show the question
+                    st.info(f"**Column:** `{current_col}`")
+                    st.markdown(f"**AI Question:** {st.session_state.current_question}")
+                    
+                    # Show sample data
+                    sample_data = st.session_state.df[current_col].dropna().head(5).tolist()
+                    st.caption(f"**Sample values:** {', '.join([str(v) for v in sample_data])}")
+                    
+                    # User response input
+                    user_response = st.text_input(
+                        "Your answer:",
+                        placeholder="e.g., 'This column contains company names'",
+                        key=f"response_{current_idx}"
                     )
                     
-                    if selected:
-                        st.session_state.mapping[standard_field] = selected
-                    elif standard_field in st.session_state.mapping:
-                        del st.session_state.mapping[standard_field]
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("📝 Submit Answer", disabled=not user_response.strip()):
+                            with st.spinner("🤖 Processing your answer..."):
+                                # Interpret the user's response
+                                mapped_field = interpret_user_response(
+                                    user_response, current_col, STANDARD_FORMAT
+                                )
+                                
+                                if mapped_field:
+                                    st.session_state.mapping[mapped_field] = current_col
+                                    st.success(f"✅ Mapped `{current_col}` → **{mapped_field}**")
+                                else:
+                                    st.warning(f"⚠️ Couldn't map `{current_col}` - you can set it manually below")
+                                
+                                # Move to next question
+                                st.session_state.current_question_index += 1
+                                
+                                # Check if we're done
+                                if st.session_state.current_question_index >= len(st.session_state.unclear_columns):
+                                    st.session_state.ai_questions_complete = True
+                                    st.balloons()
+                                    st.success("🎉 All questions completed! Review your mappings below.")
+                                
+                                st.rerun()
+                    
+                    with col_b:
+                        if st.button("⏭️ Skip This Column"):
+                            st.session_state.current_question_index += 1
+                            if st.session_state.current_question_index >= len(st.session_state.unclear_columns):
+                                st.session_state.ai_questions_complete = True
+                            st.rerun()
                 
-                with col_b:
-                    # Show confidence if available
-                    if (st.session_state.ai_analysis and 
-                        st.session_state.ai_analysis.get('confidence') and 
-                        selected in st.session_state.ai_analysis['confidence']):
-                        
-                        confidence = st.session_state.ai_analysis['confidence'][selected]
-                        st.metric("AI Confidence", f"{confidence:.0%}")
+            elif st.session_state.ai_questions_complete:
+                st.success("🎉 AI questioning complete!")
+                if st.button("🔄 Restart Questions"):
+                    st.session_state.current_question_index = 0
+                    st.session_state.ai_questions_complete = False
+                    st.rerun()
     
-    # Chat interface
-    if st.session_state.df is not None:
-        st.header("💬 Ask AI About Mappings")
+    # Manual Mapping Interface (always visible after AI analysis)
+    if st.session_state.df is not None and st.session_state.ai_analysis:
+        st.header("🔗 Review & Adjust Mappings")
         
-        # Display chat history
-        if st.session_state.chat_history:
-            with st.container():
-                for i, (user_msg, ai_msg) in enumerate(st.session_state.chat_history):
-                    st.markdown(f"**🙋 You:** {user_msg}")
-                    st.markdown(f"**🤖 AI:** {ai_msg}")
-                    if i < len(st.session_state.chat_history) - 1:
-                        st.divider()
+        input_columns = [""] + list(st.session_state.df.columns)
         
-        # Chat input
-        with st.container():
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                user_question = st.text_input(
-                    "Ask about field mappings:",
-                    placeholder="e.g., 'What should I do with the Phone1 and Phone2 columns?'",
-                    key="chat_input"
-                )
-            with col2:
-                send_button = st.button("Send", type="secondary", use_container_width=True)
+        # Show current mappings in a nice format
+        col1, col2 = st.columns(2)
         
-        if (user_question and send_button) or (user_question and st.session_state.get('send_pressed')):
-            if 'send_pressed' in st.session_state:
-                del st.session_state['send_pressed']
+        with col1:
+            st.subheader("🎯 Field Mappings")
+            
+            for standard_field, description in STANDARD_FORMAT.items():
+                current_value = st.session_state.mapping.get(standard_field, "")
+                if current_value not in input_columns:
+                    current_value = ""
                 
-            context = {
-                "columns": list(st.session_state.df.columns),
-                "current_mapping": st.session_state.mapping,
-                "standard_format": STANDARD_FORMAT,
-                "sample_data": st.session_state.df.head(2).to_dict()
-            }
+                selected = st.selectbox(
+                    f"`{standard_field}` - {description}",
+                    input_columns,
+                    index=input_columns.index(current_value) if current_value in input_columns else 0,
+                    key=f"manual_mapping_{standard_field}"
+                )
+                
+                if selected:
+                    st.session_state.mapping[standard_field] = selected
+                elif standard_field in st.session_state.mapping:
+                    del st.session_state.mapping[standard_field]
+        
+        with col2:
+            st.subheader("📊 Mapping Status")
             
-            with st.spinner("🤖 AI is thinking..."):
-                ai_response = chat_with_ai(user_question, str(context))
-                st.session_state.chat_history.append((user_question, ai_response))
+            mapped_fields = [f for f, col in st.session_state.mapping.items() if col]
+            unmapped_input_cols = [col for col in st.session_state.df.columns 
+                                 if col not in st.session_state.mapping.values()]
             
-            st.rerun()
+            st.metric("Mapped Fields", f"{len(mapped_fields)}/{len(STANDARD_FORMAT)}")
+            st.metric("Unmapped Input Columns", len(unmapped_input_cols))
+            
+            if mapped_fields:
+                st.markdown("**✅ Mapped:**")
+                for field in mapped_fields:
+                    st.markdown(f"• {field} ← `{st.session_state.mapping[field]}`")
+            
+            if unmapped_input_cols:
+                st.markdown("**⚠️ Unmapped Input Columns:**")
+                for col in unmapped_input_cols:
+                    st.markdown(f"• `{col}`")
     
     # Preview and Download
     if st.session_state.df is not None and st.session_state.mapping:
@@ -299,28 +405,6 @@ def main():
         
         # Apply mapping
         mapped_df = apply_mapping(st.session_state.df, st.session_state.mapping)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📋 Mapping Summary")
-            mapped_count = sum(1 for v in st.session_state.mapping.values() if v)
-            st.metric("Mapped Fields", f"{mapped_count}/{len(STANDARD_FORMAT)}")
-            
-            for standard_field, input_column in st.session_state.mapping.items():
-                if input_column:
-                    st.success(f"✅ `{standard_field}` ← `{input_column}`")
-        
-        with col2:
-            st.subheader("⚠️ Unmapped Fields")
-            unmapped = [col for col in st.session_state.df.columns 
-                       if col not in st.session_state.mapping.values()]
-            
-            if unmapped:
-                for col in unmapped:
-                    st.warning(f"❌ `{col}` (not mapped)")
-            else:
-                st.success("🎉 All input fields are mapped!")
         
         # Show preview
         st.subheader("📊 Output Preview")
